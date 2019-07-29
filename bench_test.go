@@ -6,10 +6,15 @@ import (
 	"testing"
 
 	"github.com/libp2p/go-libp2p-core/network"
+	pstore "github.com/libp2p/go-libp2p-peerstore"
+	"github.com/libp2p/go-libp2p-peerstore/pstoremem"
+
+	"github.com/libp2p/go-libp2p-core/protocol"
+
 )
 
 func randomConns(tb testing.TB) (c [5000]network.Conn) {
-	for i, _ := range c {
+	for i := range c {
 		c[i] = randConn(tb, nil)
 	}
 	return c
@@ -17,7 +22,8 @@ func randomConns(tb testing.TB) (c [5000]network.Conn) {
 
 func BenchmarkLockContention(b *testing.B) {
 	conns := randomConns(b)
-	cm := NewConnManager(1000, 1000, 0)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1000, 1000, 0, ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 
 	kill := make(chan struct{})

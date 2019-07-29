@@ -10,6 +10,8 @@ import (
 	"github.com/libp2p/go-libp2p-core/connmgr"
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
+	pstore "github.com/libp2p/go-libp2p-core/peerstore"
+	"github.com/libp2p/go-libp2p-core/protocol"
 
 	logging "github.com/ipfs/go-log"
 	ma "github.com/multiformats/go-multiaddr"
@@ -19,22 +21,27 @@ var SilencePeriod = 10 * time.Second
 
 var log = logging.Logger("connmgr")
 
-// BasicConnMgr is a ConnManager that trims connections whenever the count exceeds the
+// PhoreConnMgr is a ConnManager that trims connections whenever the count exceeds the
 // high watermark. New connections are given a grace period before they're subject
 // to trimming. Trims are automatically run on demand, only if the time from the
 // previous trim is higher than 10 seconds. Furthermore, trims can be explicitly
-// requested through the public interface of this struct (see TrimOpenConns).
+// requested through the public interface of this struct (see TrimOpenConns). It also
+// protects a minimum level of peers per protocol so that you can always guarantee that
+// some number of peers are kept per protocol.
 //
 // See configuration parameters in NewConnManager.
-type BasicConnMgr struct {
+type PhoreConnMgr struct {
 	highWater   int
 	lowWater    int
 	connCount   int32
 	gracePeriod time.Duration
 	segments    segments
 
-	plk       sync.RWMutex
-	protected map[peer.ID]map[string]struct{}
+	plk                     sync.RWMutex
+	protected               map[peer.ID]map[string]struct{}
+	minimumPeersForProtocol map[protocol.ID]int
+
+	peerstore pstore.Peerstore
 
 	// channel-based semaphore that enforces only a single trim is in progress
 	trimRunningCh chan struct{}
@@ -45,7 +52,7 @@ type BasicConnMgr struct {
 	cancel func()
 }
 
-var _ connmgr.ConnManager = (*BasicConnMgr)(nil)
+var _ connmgr.ConnManager = (*PhoreConnMgr)(nil)
 
 type segment struct {
 	sync.Mutex
@@ -84,23 +91,25 @@ func (s *segment) tagInfoFor(p peer.ID) *peerInfo {
 	return pi
 }
 
-// NewConnManager creates a new BasicConnMgr with the provided params:
+// NewConnManager creates a new PhoreConnMgr with the provided params:
 // * lo and hi are watermarks governing the number of connections that'll be maintained.
 //   When the peer count exceeds the 'high watermark', as many peers will be pruned (and
 //   their connections terminated) until 'low watermark' peers remain.
 // * grace is the amount of time a newly opened connection is given before it becomes
 //   subject to pruning.
-func NewConnManager(low, hi int, grace time.Duration) *BasicConnMgr {
+func NewConnManager(low, hi int, grace time.Duration, peerstore pstore.Peerstore, protectedProtocols map[protocol.ID]int) *PhoreConnMgr {
 	ctx, cancel := context.WithCancel(context.Background())
-	cm := &BasicConnMgr{
+	cm := &PhoreConnMgr{
 		highWater:     hi,
 		lowWater:      low,
 		gracePeriod:   grace,
 		trimRunningCh: make(chan struct{}, 1),
 		protected:     make(map[peer.ID]map[string]struct{}, 16),
+		peerstore: peerstore,
 		silencePeriod: SilencePeriod,
 		ctx:           ctx,
 		cancel:        cancel,
+		minimumPeersForProtocol: protectedProtocols,
 		segments: func() (ret segments) {
 			for i := range ret {
 				ret[i] = &segment{
@@ -115,12 +124,12 @@ func NewConnManager(low, hi int, grace time.Duration) *BasicConnMgr {
 	return cm
 }
 
-func (cm *BasicConnMgr) Close() error {
+func (cm *PhoreConnMgr) Close() error {
 	cm.cancel()
 	return nil
 }
 
-func (cm *BasicConnMgr) Protect(id peer.ID, tag string) {
+func (cm *PhoreConnMgr) Protect(id peer.ID, tag string) {
 	cm.plk.Lock()
 	defer cm.plk.Unlock()
 
@@ -132,7 +141,7 @@ func (cm *BasicConnMgr) Protect(id peer.ID, tag string) {
 	tags[tag] = struct{}{}
 }
 
-func (cm *BasicConnMgr) Unprotect(id peer.ID, tag string) (protected bool) {
+func (cm *PhoreConnMgr) Unprotect(id peer.ID, tag string) (protected bool) {
 	cm.plk.Lock()
 	defer cm.plk.Unlock()
 
@@ -166,7 +175,7 @@ type peerInfo struct {
 //
 // TODO: error return value so we can cleanly signal we are aborting because:
 // (a) there's another trim in progress, or (b) the silence period is in effect.
-func (cm *BasicConnMgr) TrimOpenConns(ctx context.Context) {
+func (cm *PhoreConnMgr) TrimOpenConns(ctx context.Context) {
 	select {
 	case cm.trimRunningCh <- struct{}{}:
 	default:
@@ -188,7 +197,7 @@ func (cm *BasicConnMgr) TrimOpenConns(ctx context.Context) {
 	cm.lastTrim = time.Now()
 }
 
-func (cm *BasicConnMgr) background() {
+func (cm *PhoreConnMgr) background() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 
@@ -207,7 +216,7 @@ func (cm *BasicConnMgr) background() {
 
 // getConnsToClose runs the heuristics described in TrimOpenConns and returns the
 // connections to close.
-func (cm *BasicConnMgr) getConnsToClose(ctx context.Context) []network.Conn {
+func (cm *PhoreConnMgr) getConnsToClose(ctx context.Context) []network.Conn {
 	if cm.lowWater == 0 || cm.highWater == 0 {
 		// disabled
 		return nil
@@ -221,14 +230,44 @@ func (cm *BasicConnMgr) getConnsToClose(ctx context.Context) []network.Conn {
 
 	npeers := cm.segments.countPeers()
 	candidates := make([]*peerInfo, 0, npeers)
+
+	numPeersForProto := make(map[protocol.ID]int)
+
 	cm.plk.RLock()
 	for _, s := range cm.segments {
 		s.Lock()
+		next_peer_loop:
 		for id, inf := range s.peers {
 			if _, ok := cm.protected[id]; ok {
 				// skip over protected peer.
 				continue
 			}
+
+			peerSupportedProtos, err := cm.peerstore.GetProtocols(id)
+			if err != nil {
+				candidates = append(candidates, inf)
+				continue next_peer_loop
+			}
+
+			for _, supportedProto := range peerSupportedProtos {
+				supportedID := protocol.ID(supportedProto)
+				_, found := numPeersForProto[supportedID]
+				if !found {
+					numPeersForProto[supportedID] = 1
+				} else {
+					numPeersForProto[supportedID]++
+				}
+				minPeers, found := cm.minimumPeersForProtocol[supportedID]
+				if !found || minPeers <= 0 {
+					continue
+				}
+
+				if numPeersForProto[supportedID] <= minPeers {
+					// if we don't have enough enough peers for this yet, don't allow deletion
+					continue next_peer_loop
+				}
+			}
+
 			candidates = append(candidates, inf)
 		}
 		s.Unlock()
@@ -282,7 +321,7 @@ func (cm *BasicConnMgr) getConnsToClose(ctx context.Context) []network.Conn {
 
 // GetTagInfo is called to fetch the tag information associated with a given
 // peer, nil is returned if p refers to an unknown peer.
-func (cm *BasicConnMgr) GetTagInfo(p peer.ID) *connmgr.TagInfo {
+func (cm *PhoreConnMgr) GetTagInfo(p peer.ID) *connmgr.TagInfo {
 	s := cm.segments.get(p)
 	s.Lock()
 	defer s.Unlock()
@@ -310,7 +349,7 @@ func (cm *BasicConnMgr) GetTagInfo(p peer.ID) *connmgr.TagInfo {
 }
 
 // TagPeer is called to associate a string and integer with a given peer.
-func (cm *BasicConnMgr) TagPeer(p peer.ID, tag string, val int) {
+func (cm *PhoreConnMgr) TagPeer(p peer.ID, tag string, val int) {
 	s := cm.segments.get(p)
 	s.Lock()
 	defer s.Unlock()
@@ -323,7 +362,7 @@ func (cm *BasicConnMgr) TagPeer(p peer.ID, tag string, val int) {
 }
 
 // UntagPeer is called to disassociate a string and integer from a given peer.
-func (cm *BasicConnMgr) UntagPeer(p peer.ID, tag string) {
+func (cm *PhoreConnMgr) UntagPeer(p peer.ID, tag string) {
 	s := cm.segments.get(p)
 	s.Lock()
 	defer s.Unlock()
@@ -340,7 +379,7 @@ func (cm *BasicConnMgr) UntagPeer(p peer.ID, tag string) {
 }
 
 // UpsertTag is called to insert/update a peer tag
-func (cm *BasicConnMgr) UpsertTag(p peer.ID, tag string, upsert func(int) int) {
+func (cm *PhoreConnMgr) UpsertTag(p peer.ID, tag string, upsert func(int) int) {
 	s := cm.segments.get(p)
 	s.Lock()
 	defer s.Unlock()
@@ -353,7 +392,7 @@ func (cm *BasicConnMgr) UpsertTag(p peer.ID, tag string, upsert func(int) int) {
 	pi.tags[tag] = newval
 }
 
-// CMInfo holds the configuration for BasicConnMgr, as well as status data.
+// CMInfo holds the configuration for PhoreConnMgr, as well as status data.
 type CMInfo struct {
 	// The low watermark, as described in NewConnManager.
 	LowWater int
@@ -369,10 +408,13 @@ type CMInfo struct {
 
 	// The current connection count.
 	ConnCount int
+
+	// The minimum number of peers to maintain per protocol
+	PerProtocolMinimum map[protocol.ID]string
 }
 
 // GetInfo returns the configuration and status data for this connection manager.
-func (cm *BasicConnMgr) GetInfo() CMInfo {
+func (cm *PhoreConnMgr) GetInfo() CMInfo {
 	return CMInfo{
 		HighWater:   cm.highWater,
 		LowWater:    cm.lowWater,
@@ -382,21 +424,21 @@ func (cm *BasicConnMgr) GetInfo() CMInfo {
 	}
 }
 
-// Notifee returns a sink through which Notifiers can inform the BasicConnMgr when
+// Notifee returns a sink through which Notifiers can inform the PhoreConnMgr when
 // events occur. Currently, the notifee only reacts upon connection events
 // {Connected, Disconnected}.
-func (cm *BasicConnMgr) Notifee() network.Notifiee {
+func (cm *PhoreConnMgr) Notifee() network.Notifiee {
 	return (*cmNotifee)(cm)
 }
 
-type cmNotifee BasicConnMgr
+type cmNotifee PhoreConnMgr
 
-func (nn *cmNotifee) cm() *BasicConnMgr {
-	return (*BasicConnMgr)(nn)
+func (nn *cmNotifee) cm() *PhoreConnMgr {
+	return (*PhoreConnMgr)(nn)
 }
 
 // Connected is called by notifiers to inform that a new connection has been established.
-// The notifee updates the BasicConnMgr to start tracking the connection. If the new connection
+// The notifee updates the PhoreConnMgr to start tracking the connection. If the new connection
 // count exceeds the high watermark, a trim may be triggered.
 func (nn *cmNotifee) Connected(n network.Network, c network.Conn) {
 	cm := nn.cm()
@@ -405,6 +447,8 @@ func (nn *cmNotifee) Connected(n network.Network, c network.Conn) {
 	s := cm.segments.get(p)
 	s.Lock()
 	defer s.Unlock()
+
+
 
 	id := c.RemotePeer()
 	pinfo, ok := s.peers[id]
@@ -435,7 +479,7 @@ func (nn *cmNotifee) Connected(n network.Network, c network.Conn) {
 }
 
 // Disconnected is called by notifiers to inform that an existing connection has been closed or terminated.
-// The notifee updates the BasicConnMgr accordingly to stop tracking the connection, and performs housekeeping.
+// The notifee updates the PhoreConnMgr accordingly to stop tracking the connection, and performs housekeeping.
 func (nn *cmNotifee) Disconnected(n network.Network, c network.Conn) {
 	cm := nn.cm()
 

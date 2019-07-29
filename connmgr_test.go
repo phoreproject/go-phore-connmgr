@@ -2,6 +2,7 @@ package connmgr
 
 import (
 	"context"
+	"github.com/libp2p/go-libp2p-core/protocol"
 	"testing"
 	"time"
 
@@ -9,6 +10,8 @@ import (
 
 	"github.com/libp2p/go-libp2p-core/network"
 	"github.com/libp2p/go-libp2p-core/peer"
+	pstore "github.com/libp2p/go-libp2p-peerstore"
+	"github.com/libp2p/go-libp2p-peerstore/pstoremem"
 
 	tu "github.com/libp2p/go-libp2p-core/test"
 	ma "github.com/multiformats/go-multiaddr"
@@ -48,7 +51,8 @@ func randConn(t testing.TB, discNotify func(network.Network, network.Conn)) netw
 }
 
 func TestConnTrimming(t *testing.T) {
-	cm := NewConnManager(200, 300, 0)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(200, 300, 0, ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 
 	var conns []network.Conn
@@ -85,25 +89,26 @@ func TestConnTrimming(t *testing.T) {
 }
 
 func TestConnsToClose(t *testing.T) {
-	cm := NewConnManager(0, 10, 0)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(200, 300, 0, ps, map[protocol.ID]int{})
 	conns := cm.getConnsToClose(context.Background())
 	if conns != nil {
 		t.Fatal("expected no connections")
 	}
 
-	cm = NewConnManager(10, 0, 0)
+	cm = NewConnManager(10, 0, 0, ps, map[protocol.ID]int{})
 	conns = cm.getConnsToClose(context.Background())
 	if conns != nil {
 		t.Fatal("expected no connections")
 	}
 
-	cm = NewConnManager(1, 1, 0)
+	cm = NewConnManager(1, 1, 0, ps, map[protocol.ID]int{})
 	conns = cm.getConnsToClose(context.Background())
 	if conns != nil {
 		t.Fatal("expected no connections")
 	}
 
-	cm = NewConnManager(1, 1, time.Duration(10*time.Minute))
+	cm = NewConnManager(1, 1, time.Duration(10*time.Minute), ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 	for i := 0; i < 5; i++ {
 		conn := randConn(t, nil)
@@ -117,7 +122,8 @@ func TestConnsToClose(t *testing.T) {
 
 func TestGetTagInfo(t *testing.T) {
 	start := time.Now()
-	cm := NewConnManager(1, 1, time.Duration(10*time.Minute))
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 1, time.Duration(10*time.Minute), ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 	conn := randConn(t, nil)
 	not.Connected(nil, conn)
@@ -187,7 +193,8 @@ func TestGetTagInfo(t *testing.T) {
 }
 
 func TestTagPeerNonExistant(t *testing.T) {
-	cm := NewConnManager(1, 1, time.Duration(10*time.Minute))
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 1, time.Duration(10*time.Minute), ps, map[protocol.ID]int{})
 
 	id := tu.RandPeerIDFatal(t)
 	cm.TagPeer(id, "test", 1)
@@ -198,7 +205,8 @@ func TestTagPeerNonExistant(t *testing.T) {
 }
 
 func TestUntagPeer(t *testing.T) {
-	cm := NewConnManager(1, 1, time.Duration(10*time.Minute))
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 1, time.Duration(10*time.Minute), ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 	conn := randConn(t, nil)
 	not.Connected(nil, conn)
@@ -229,7 +237,8 @@ func TestUntagPeer(t *testing.T) {
 func TestGetInfo(t *testing.T) {
 	start := time.Now()
 	gp := time.Duration(10 * time.Minute)
-	cm := NewConnManager(1, 5, gp)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 5, gp, ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 	conn := randConn(t, nil)
 	not.Connected(nil, conn)
@@ -256,7 +265,8 @@ func TestGetInfo(t *testing.T) {
 
 func TestDoubleConnection(t *testing.T) {
 	gp := time.Duration(10 * time.Minute)
-	cm := NewConnManager(1, 5, gp)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 5, gp, ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 	conn := randConn(t, nil)
 	not.Connected(nil, conn)
@@ -272,7 +282,8 @@ func TestDoubleConnection(t *testing.T) {
 
 func TestDisconnected(t *testing.T) {
 	gp := time.Duration(10 * time.Minute)
-	cm := NewConnManager(1, 5, gp)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 5, gp, ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 	conn := randConn(t, nil)
 	not.Connected(nil, conn)
@@ -309,7 +320,8 @@ func TestQuickBurstRespectsSilencePeriod(t *testing.T) {
 		t.Skip("race detector is unhappy with this test")
 	}
 
-	cm := NewConnManager(10, 20, 0)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(10, 20, 0, ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 
 	var conns []network.Conn
@@ -345,7 +357,8 @@ func TestPeerProtectionSingleTag(t *testing.T) {
 	}
 
 	SilencePeriod = 0
-	cm := NewConnManager(19, 20, 0)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(19, 20, 0, ps, map[protocol.ID]int{})
 	SilencePeriod = 10 * time.Second
 
 	not := cm.Notifee()
@@ -408,7 +421,8 @@ func TestPeerProtectionMultipleTags(t *testing.T) {
 	}
 
 	SilencePeriod = 0
-	cm := NewConnManager(19, 20, 0)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(19, 20, 0, ps, map[protocol.ID]int{})
 	SilencePeriod = 10 * time.Second
 
 	not := cm.Notifee()
@@ -493,7 +507,8 @@ func TestPeerProtectionMultipleTags(t *testing.T) {
 
 func TestPeerProtectionIdempotent(t *testing.T) {
 	SilencePeriod = 0
-	cm := NewConnManager(10, 20, 0)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(10, 20, 0, ps, map[protocol.ID]int{})
 	SilencePeriod = 10 * time.Second
 
 	id, _ := tu.RandPeerID()
@@ -524,7 +539,8 @@ func TestPeerProtectionIdempotent(t *testing.T) {
 }
 
 func TestUpsertTag(t *testing.T) {
-	cm := NewConnManager(1, 1, time.Duration(10*time.Minute))
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 1, time.Duration(10*time.Minute), ps, map[protocol.ID]int{})
 	not := cm.Notifee()
 	conn := randConn(t, nil)
 	rp := conn.RemotePeer()
@@ -559,7 +575,8 @@ func TestUpsertTag(t *testing.T) {
 }
 
 func TestTemporaryEntriesClearedFirst(t *testing.T) {
-	cm := NewConnManager(1, 1, 0)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 1, 0, ps, map[protocol.ID]int{})
 
 	id := tu.RandPeerIDFatal(t)
 	cm.TagPeer(id, "test", 20)
@@ -580,7 +597,8 @@ func TestTemporaryEntriesClearedFirst(t *testing.T) {
 }
 
 func TestTemporaryEntryConvertedOnConnection(t *testing.T) {
-	cm := NewConnManager(1, 1, 0)
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 1, 0, ps, map[protocol.ID]int{})
 
 	conn := randConn(t, nil)
 	cm.TagPeer(conn.RemotePeer(), "test", 20)
@@ -596,5 +614,54 @@ func TestTemporaryEntryConvertedOnConnection(t *testing.T) {
 
 	if ti.value != 20 || ti.temp {
 		t.Fatal("expected a non-temporary tag with value 20")
+	}
+}
+
+func TestConnProtocolLogic(t *testing.T) {
+	ps := pstore.NewPeerstore(pstoremem.NewKeyBook(), pstoremem.NewAddrBook(), pstoremem.NewProtoBook(), pstoremem.NewPeerMetadata())
+	cm := NewConnManager(1, 1, 0, ps, map[protocol.ID]int{
+		"/phore/1.0.0": 50,
+		"/test/2.0.0": 30,
+	})
+	not := cm.Notifee()
+
+	var conns []network.Conn
+	for i := 0; i < 300; i++ {
+		rc := randConn(t, nil)
+		conns = append(conns, rc)
+		not.Connected(nil, rc)
+	}
+
+	for i := 0; i < 60; i++ {
+		err := ps.AddProtocols(conns[i].RemotePeer(), "/phore/1.0.0")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 60; i < 100; i++ {
+		err := ps.AddProtocols(conns[i].RemotePeer(), "/test/2.0.0")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, c := range conns {
+		if c.(*tconn).closed {
+			t.Fatal("nothing should be closed yet")
+		}
+	}
+	cm.TrimOpenConns(context.Background())
+
+	numPeers := 0
+	for _, c := range conns {
+		if !c.(*tconn).closed {
+			numPeers++
+		}
+	}
+
+	t.Log(numPeers)
+
+	if numPeers != 80 {
+		t.Fatal("expected 80 connections after trimming as many peers as possible")
 	}
 }
